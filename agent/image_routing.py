@@ -7,6 +7,8 @@ non-vision models). :func:`decide_image_input_mode` picks once per turn from
 explicit ``auxiliary.vision`` backend forces ``text`` even for vision-capable
 main models (``native`` is the absolute override); else ``supports_vision``
 (config override or catalog) decides. ``vision_analyze`` stays a tool regardless.
+Delegated children are exempt from the aux pin: ``delegation.image_input_mode``
+(``auto`` by default) pins them, else the child's own model decides.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ from contextlib import suppress
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+from agent.delegation_context import is_delegated_child_process_context
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +376,12 @@ def _lookup_supports_vision(
     return None
 
 
+def _delegation_image_mode(cfg: Optional[dict[str, Any]]) -> str:
+    """``delegation.image_input_mode`` coerced to a valid mode (``auto`` default)."""
+    raw = _dict_or_empty(_dict_or_empty(cfg).get("delegation")).get("image_input_mode")
+    return _coerce_mode(raw)
+
+
 def decide_image_input_mode(
     provider: str,
     model: str,
@@ -380,12 +390,24 @@ def decide_image_input_mode(
     requested_provider: str = "",
 ) -> str:
     """Return ``"native"`` or ``"text"`` for the given turn (``cfg`` None behaves as
-    auto; ``requested_provider`` is the identity before runtime canonicalization)."""
-    mode_cfg = _coerce_mode(_dict_or_empty(_dict_or_empty(cfg).get("agent")).get("image_input_mode"))
-    if mode_cfg != "auto":
-        return mode_cfg
-    if _explicit_aux_vision_override(cfg):  # auto: an explicit auxiliary.vision backend wins
-        return "text"
+    auto; ``requested_provider`` is the identity before runtime canonicalization).
+
+    In delegated-child context a pinned ``delegation.image_input_mode`` wins over
+    everything, and the explicit-``auxiliary.vision`` pin does NOT force ``text``:
+    that pin serves the MAIN conversation's vision tool, while the child is a
+    separate conversation whose own model may be vision-capable — routing its
+    ``images:`` attachments through the pinned describer instead loses fidelity
+    and pays a describer round-trip for no benefit."""
+    if is_delegated_child_process_context():
+        mode = _delegation_image_mode(cfg)
+        if mode != "auto":
+            return mode
+    else:
+        mode_cfg = _coerce_mode(_dict_or_empty(_dict_or_empty(cfg).get("agent")).get("image_input_mode"))
+        if mode_cfg != "auto":
+            return mode_cfg
+        if _explicit_aux_vision_override(cfg):  # auto: an explicit auxiliary.vision backend wins
+            return "text"
     # Keep the three-argument call contract for callers/tests that replace the lookup hook.
     extra = {"requested_provider": requested_provider} if requested_provider else {}
     return "native" if _lookup_supports_vision(provider, model, cfg, **extra) is True else "text"

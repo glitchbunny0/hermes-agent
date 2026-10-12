@@ -850,7 +850,13 @@ class _ChildRun:
         worker_thread_holder: dict[str, Optional[threading.Thread]] = {"t": None}
         # Resolved after seed_workspace so a multimodal goal's text part carries the worktree note too.
         _images = list(getattr(child, "_delegate_images", None) or [])
-        user_message: Any = _build_child_goal_message(self.goal, _images, child) if _images else self.goal
+        # Inside delegated_child_context: decide_image_input_mode must see the child scope, or a
+        # main-conversation auxiliary.vision pin would strip pixels from the goal message even
+        # for a vision-capable child.
+        from agent.delegation_context import delegated_child_context as _delegated_ctx
+
+        with _delegated_ctx(str(getattr(child, "session_id", "") or "")):
+            user_message: Any = _build_child_goal_message(self.goal, _images, child) if _images else self.goal
 
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
