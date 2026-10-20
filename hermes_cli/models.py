@@ -22,14 +22,12 @@ import urllib.request
 import urllib.error
 import time
 from pathlib import Path
-from typing import Any, Optional, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from typing import TypeGuard
+from typing import Any, Optional
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.urllib_security import open_credentialed_url
 from hermes_cli.version_info import get_version_info
+from hermes_cli.models_cache_rows import cache_entry_valid, same_credential_identity
 from hermes_cli.models_catalog_static import (
     CuratedFallbackModels,
     CANONICAL_PROVIDERS,
@@ -1890,7 +1888,7 @@ def _live_result_entry(fp: str, live: list[str], existing: Any, at: Optional[flo
     stored it is flagged so it expires on the short fallback TTL."""
     if not isinstance(live, CuratedFallbackModels):
         return _cache_entry(fp, live, at)
-    if _cache_entry_valid(existing, fp) and not existing.get("fallback"):
+    if cache_entry_valid(existing, fp) and not existing.get("fallback"):
         return None
     return {**_cache_entry(fp, live, at), "fallback": True}
 
@@ -1955,10 +1953,17 @@ def _credential_fingerprint(provider: str) -> str:
     API-key providers include their configured values and credential-file mtimes. Codex uses the
     stable principal selected by its read-only resolver: routine token and pool-state writes must
     not discard an account-scoped catalog, while a real account switch must invalidate it.
+
+    The result is ``<identity>-<files>``. *identity* covers what the credentials ARE (env values,
+    effective endpoint); *files* only the mtimes of credential files, which move on every pool
+    status flip, token refresh or rate-limit write of ANY provider. Equality still means "same
+    credentials, unchanged files"; ``models_cache_rows.same_credential_identity`` compares the
+    identity half alone.
     """
     import hashlib
 
     parts: list[str] = []
+    file_parts: list[str] = []
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
         pcfg = PROVIDER_REGISTRY.get(provider)
@@ -2021,9 +2026,9 @@ def _credential_fingerprint(provider: str) -> str:
 
     def _mtime_part(label: str, path) -> None:
         try:
-            parts.append(f"{label}@{os.stat(path).st_mtime_ns}")
+            file_parts.append(f"{label}@{os.stat(path).st_mtime_ns}")
         except FileNotFoundError:
-            parts.append(f"{label}@missing")
+            file_parts.append(f"{label}@missing")
         except Exception:
             pass
 
@@ -2043,10 +2048,13 @@ def _credential_fingerprint(provider: str) -> str:
             path = os.path.expanduser(rel)
             _mtime_part(path, path)
 
-    blob = "|".join(parts).encode("utf-8", errors="replace")
     # blake2b, not sha256: fingerprint only (collisions = a harmless cache miss), and CodeQL's
     # weak-sensitive-data-hashing rule flags sha256 over env vars named *API_KEY*/*TOKEN*.
-    return hashlib.blake2b(blob, digest_size=8).hexdigest()
+    def _digest(items: list[str]) -> str:
+        return hashlib.blake2b("|".join(items).encode("utf-8", errors="replace"), digest_size=8).hexdigest()
+
+    # Codex has no file component: its fingerprint stays the bare identity hash.
+    return f"{_digest(parts)}-{_digest(file_parts)}" if file_parts else _digest(parts)
 
 
 def _load_provider_models_cache() -> dict:
@@ -2121,7 +2129,8 @@ def cached_provider_model_ids(
         # SWR window is still served (hour-old catalog beats an empty picker) while a daemon thread
         # warms the next open; a cold row returns [] and the caller falls back to its curated list.
         _spawn_swr_refresh(normalized)
-        if _cache_entry_valid(entry, fp, allow_empty=is_ollama):
+        if (cache_entry_valid(entry, fp, allow_empty=is_ollama)
+                or same_credential_identity(entry, fp)):
             return _chat_catalog_rows([
                 model for model in entry["models"]
                 if not _model_requires_account_discovery(normalized, model)])
@@ -2150,7 +2159,7 @@ def cached_provider_model_ids(
     # Live returned nothing: a stale same-fingerprint entry beats an empty result — minus account-gated
     # models, which only a successful discovery may advertise (the entry itself is untouched, so the
     # next successful fetch restores them).
-    if _cache_entry_valid(entry, fp):
+    if cache_entry_valid(entry, fp):
         return _chat_catalog_rows([model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)])
     return []
 
@@ -2892,20 +2901,6 @@ def _custom_endpoint_fingerprint(
     return hashlib.blake2b(blob.encode("utf-8", errors="replace"), digest_size=8).hexdigest()
 
 
-def _cache_entry_valid(
-    entry: Any, fp: str, *, allow_empty: bool = False) -> TypeGuard[dict[str, Any]]:
-    """Well-formed cache row for fingerprint *fp*. Requires a numeric ``at`` so corrupt disk state
-    degrades to a cache miss instead of raising; empty model lists are valid only when the caller
-    opts into an authoritative empty catalog."""
-    return (
-        isinstance(entry, dict)
-        and entry.get("fp") == fp
-        and isinstance(entry.get("models"), list)
-        and (allow_empty or bool(entry["models"]))
-        and isinstance(entry.get("at"), (int, float))
-        and not isinstance(entry.get("at"), bool))
-
-
 def _disk_serve_tier(entry: Any, fp: str, now: float, *, is_ollama: bool,
                      ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL) -> Optional[str]:
     """How :func:`cached_provider_model_ids` serves *entry* without the network.
@@ -2917,7 +2912,7 @@ def _disk_serve_tier(entry: Any, fp: str, now: float, *, is_ollama: bool,
     short native TTL, never through the stale window."""
     if is_ollama:
         ttl_seconds = min(ttl_seconds, _OLLAMA_LOCAL_MODELS_CACHE_TTL)
-    if not _cache_entry_valid(entry, fp, allow_empty=is_ollama):
+    if not cache_entry_valid(entry, fp, allow_empty=is_ollama):
         return None
     age = now - entry["at"]
     if age < (_PROVIDER_MODELS_FALLBACK_TTL if entry.get("fallback") else ttl_seconds):
@@ -2966,7 +2961,7 @@ def cached_fetch_api_models(
     entry = cache.get(cache_key)
     now = time.time()
     native_row = isinstance(entry, dict) and entry.get("native_catalog") is True
-    valid = not force_refresh and _cache_entry_valid(entry, fp, allow_empty=native_row)
+    valid = not force_refresh and cache_entry_valid(entry, fp, allow_empty=native_row)
 
     if valid:
         age = now - entry["at"]
@@ -2997,6 +2992,6 @@ def cached_fetch_api_models(
         return _catalog(stored)
     # Live returned nothing (offline, timeout, auth hiccup): a stale same-fingerprint entry beats it
     # (non-empty only: an empty native row is not worth resurrecting over the generic fallback).
-    if _cache_entry_valid(entry, fp):
+    if cache_entry_valid(entry, fp):
         return _catalog(entry)
     return _chat_catalog_rows(live)
